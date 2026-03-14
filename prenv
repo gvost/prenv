@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# prenv
+# Pretty-print and inspect environment variables
+
+SCRIPT_NAME="$(basename "$0")"
+
+SORT=false
+FILTER=""
+NO_COLOR=false
+WIDTH="${COLUMNS:-120}"
+WRAP_LONG=false
+
+COMMAND="print"
+
+# ---------------- ASCII LOGO ----------------
+print_logo() {
+cat <<'EOF'
+   ____  ____  _____ _   ___     __
+  / __ \/ __ \/ ___// | / / |   / /
+ / /_/ / /_/ /\__ \/  |/ /| |  / / 
+/ ____/ _, _/___/ / /|  / | |_/ /  
+/_/   /_/ |_|/____/_/ |_/  |___/   
+
+EOF
+}
+
+# ---------- colors ----------
+if [[ -t 1 ]]; then
+  C_RESET=$'\033[0m'
+  C_BOLD=$'\033[1m'
+  C_DIM=$'\033[2m'
+  C_BLUE=$'\033[34m'
+  C_CYAN=$'\033[36m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_MAGENTA=$'\033[35m'
+  C_RED=$'\033[31m'
+else
+  C_RESET=''
+  C_BOLD=''
+  C_DIM=''
+  C_BLUE=''
+  C_CYAN=''
+  C_GREEN=''
+  C_YELLOW=''
+  C_MAGENTA=''
+  C_RED=''
+fi
+
+usage() {
+cat <<EOF
+prenv — inspect and format your environment
+
+Usage:
+  prenv [command] [options]
+
+Commands:
+  print        Pretty print environment (default)
+  path         Show PATH entries one-per-line
+  doctor       Basic environment diagnostics
+  diff <cmd>   Compare env before/after running a command
+
+Options:
+  --sort
+  --filter <text>
+  --no-color
+  --wrap
+  --width <n>
+
+Examples:
+  prenv
+  prenv path
+  prenv doctor
+  prenv diff 'npm run build'
+EOF
+}
+
+# -------- option parsing --------
+if [[ $# -gt 0 ]]; then
+  case "$1" in
+    path|doctor|diff|print)
+      COMMAND="$1"
+      shift
+      ;;
+  esac
+fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --sort)
+      SORT=true
+      shift
+      ;;
+    --filter)
+      FILTER="${2:-}"
+      shift 2
+      ;;
+    --no-color)
+      NO_COLOR=true
+      shift
+      ;;
+    --wrap)
+      WRAP_LONG=true
+      shift
+      ;;
+    --width)
+      WIDTH="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+if [[ "$NO_COLOR" == true ]]; then
+  C_RESET=''
+  C_BOLD=''
+  C_DIM=''
+  C_BLUE=''
+  C_CYAN=''
+  C_GREEN=''
+  C_YELLOW=''
+  C_MAGENTA=''
+  C_RED=''
+fi
+
+KEY_WIDTH=28
+VALUE_WIDTH=$(( WIDTH - KEY_WIDTH - 8 ))
+
+# -------- helpers --------
+truncate_value() {
+  local value="$1"
+  local max="$2"
+
+  if (( ${#value} <= max )); then
+    printf '%s' "$value"
+  else
+    printf '%s…' "${value:0:max-1}"
+  fi
+}
+
+print_row() {
+  local key="$1"
+  local value="$2"
+
+  local label="${C_CYAN}${key}${C_RESET}"
+
+  if [[ "$WRAP_LONG" == true && ${#value} -gt VALUE_WIDTH ]]; then
+    printf "  %-*b | %s\n" "$KEY_WIDTH" "$label" "$value"
+  else
+    value=$(truncate_value "$value" "$VALUE_WIDTH")
+    printf "  %-*b | %s\n" "$KEY_WIDTH" "$label" "$value"
+  fi
+}
+
+print_section() {
+  local name="$1"
+  printf "\n${C_BOLD}${C_BLUE}%s${C_RESET}\n" "$name"
+}
+
+# -------- commands --------
+
+cmd_print() {
+  print_logo
+
+  printf "${C_DIM}environment snapshot${C_RESET}\n"
+
+  local data
+  data=$(env)
+
+  if [[ -n "$FILTER" ]]; then
+    data=$(printf "%s\n" "$data" | grep -i "$FILTER" || true)
+  fi
+
+  if [[ "$SORT" == true ]]; then
+    data=$(printf "%s\n" "$data" | sort)
+  fi
+
+  while IFS='=' read -r key value; do
+    print_row "$key" "$value"
+  done <<< "$data"
+
+  printf "\n"
+}
+
+cmd_path() {
+  print_logo
+  printf "${C_BOLD}PATH entries${C_RESET}\n\n"
+
+  IFS=':' read -r -a entries <<< "$PATH"
+
+  local i=1
+  for e in "${entries[@]}"; do
+    printf "%3s  %s\n" "$i" "$e"
+    ((i++))
+  done
+}
+
+cmd_doctor() {
+  print_logo
+  printf "${C_BOLD}environment diagnostics${C_RESET}\n\n"
+
+  printf "shell:      %s\n" "$SHELL"
+  printf "user:       %s\n" "$USER"
+  printf "home:       %s\n" "$HOME"
+
+  printf "\n"
+
+  if command -v aws >/dev/null 2>&1; then
+    printf "aws cli:    installed\n"
+    printf "aws profile: %s\n" "${AWS_PROFILE:-none}"
+  else
+    printf "aws cli:    not installed\n"
+  fi
+
+  if command -v kubectl >/dev/null 2>&1; then
+    printf "kubectl:    installed\n"
+  fi
+
+  if command -v node >/dev/null 2>&1; then
+    printf "node:       %s\n" "$(node -v)"
+  fi
+
+  printf "\nPATH length: %s entries\n" "$(echo "$PATH" | tr ':' '\n' | wc -l | xargs)"
+}
+
+cmd_diff() {
+  local cmd="$*"
+
+  if [[ -z "$cmd" ]]; then
+    echo "usage: prenv diff '<command>'"
+    exit 1
+  fi
+
+  local before after
+
+  before=$(mktemp)
+  after=$(mktemp)
+
+  env | sort > "$before"
+
+  bash -c "$cmd" >/dev/null 2>&1 || true
+
+  env | sort > "$after"
+
+  echo
+  echo "Environment changes"
+  diff "$before" "$after" || true
+
+  rm "$before" "$after"
+}
+
+# -------- dispatcher --------
+case "$COMMAND" in
+  print)
+    cmd_print
+    ;;
+  path)
+    cmd_path
+    ;;
+  doctor)
+    cmd_doctor
+    ;;
+  diff)
+    cmd_diff "$@"
+    ;;
+  *)
+    usage
+    ;;
+esac
